@@ -1,0 +1,8 @@
+displayName: JWT Rewriter
+type: middleware
+import: github.com/irotem/jwt-rewrite
+summary: 'Verify JWT Token in auth header and signs a new jwt'
+
+testData:
+  VerifyHash:
+    - "SH512"
