@@ -1,4 +1,4 @@
-package jwt_middleware
+package jwt_rewrite
 
 import (
 	"fmt"
