@@ -6,25 +6,33 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
+
 	"hash"
 	"net/http"
+	"os"
 	"strings"
 )
 
 type Config struct {
-	VerifySecret       string `json:"verify.secret,omitempty"`
-	VerifyAuthHeader   string `json:"verify.authHeader,omitempty"`
-	VerifyHeaderPrefix string `json:"verify.headerPrefix,omitempty"`
-	VerifyHash         string `json:"verify.hash,omitempty"`
-	SignSecret         string `json:"sign.secret,omitempty"`
-	SignAuthHeader     string `json:"sign.authHeader,omitempty"`
-	SignHeaderPrefix   string `json:"sign.headerPrefix,omitempty"`
-	SignHash           string `json:"sign.hash,omitempty"`
+	VerifySecret       string            `json:"VerifySecret,omitempty"`
+	VerifyAuthHeader   string            `json:"VerifyAuthHeader,omitempty"`
+	VerifyHeaderPrefix string            `json:"VerifyHeaderPrefix,omitempty"`
+	VerifyHash         string            `json:"VerifyHash,omitempty"`
+	SignSecret         string            `json:"SignSecret,omitempty"`
+	SignAuthHeader     string            `json:"SignAuthHeader,omitempty"`
+	SignHeaderPrefix   string            `json:"SignHeaderPrefix,omitempty"`
+	SignHash           string            `json:"SignHash,omitempty"`
+	CopyClaims         map[string]string `json:"copyclaims,omitempty"`
+	StaticClaims       map[string]string `json:"copyclaims,omitempty"`
 }
 
 func CreateConfig() *Config {
-	return &Config{}
+	return &Config{
+		CopyClaims:   make(map[string]string),
+		StaticClaims: make(map[string]string),
+	}
 }
 
 type JWTHeader struct {
@@ -35,13 +43,18 @@ type JWTHeader struct {
 }
 
 type JWT struct {
-	next   http.Handler
-	name   string
-	verify JWTHeader
-	sign   JWTHeader
+	next         http.Handler
+	name         string
+	verify       JWTHeader
+	sign         JWTHeader
+	copyClaims   map[string]string
+	staticClaims map[string]string
 }
 
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
+
+	_, _ = fmt.Fprintf(os.Stderr, "Claims => %#v\n", config.CopyClaims)
+	_, _ = fmt.Fprintf(os.Stderr, "Secret => %#v\n", config.VerifySecret)
 
 	if len(config.VerifyHash) == 0 {
 		config.VerifyHash = "HS256"
@@ -71,8 +84,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	return &JWT{
-		next: next,
-		name: name,
+		next:         next,
+		name:         name,
+		copyClaims:   config.CopyClaims,
+		staticClaims: config.StaticClaims,
 		verify: JWTHeader{
 			secret:       config.VerifySecret,
 			authHeader:   config.VerifyAuthHeader,
@@ -110,13 +125,39 @@ func (j *JWT) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 
 	if verified {
 		// If true decode payload
-		payload, decodeErr := decodeBase64(token.payload)
-		if decodeErr != nil {
-			http.Error(res, "Request error", http.StatusBadRequest)
+		payload, err := decodeBase64(token.payload)
+		if err != nil {
+			http.Error(res, "Decode Failed", http.StatusBadRequest)
 			return
 		}
 
-		jwt := buildJWT(payload, j.sign)
+		var jsonObject map[string]interface{}
+		err = json.Unmarshal([]byte(payload), &jsonObject)
+		if err != nil {
+			http.Error(res, "Decode Failed", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("OBJECT %v", jsonObject)
+		for k, v := range j.copyClaims {
+			fmt.Printf("Claim copied from %s to %s \n", k, v)
+
+			decodedReplacement, err := base64.StdEncoding.DecodeString(v)
+			if err != nil {
+				http.Error(res, "Decode Failed", http.StatusBadRequest)
+				return
+			}
+
+			value, ok := jsonObject[k].(string)
+			if !ok {
+				http.Error(res, "Decode Failed", http.StatusBadRequest)
+			}
+
+			lastStr := strings.ReplaceAll(string(decodedReplacement), "$"+k+"$", value)
+			payload = payload[:len(payload)-1] + "," + lastStr + "}"
+		}
+
+		jwt := buildJWT([]byte(payload), j.sign)
 		// Inject header as proxypayload or configured name
 		req.Header.Del(j.sign.authHeader)
 		req.Header.Add(j.verify.authHeader, j.verify.headerPrefix+" "+jwt)
@@ -166,7 +207,7 @@ func verifyJWT(token Token, secret string, jwtType string) (bool, error) {
 }
 
 // verifyJWT Verifies jwt token with secret
-func buildJWT(payload string, sign JWTHeader) string {
+func buildJWT(payload []byte, sign JWTHeader) string {
 
 	var mac hash.Hash
 	switch sign.hash {
@@ -180,7 +221,7 @@ func buildJWT(payload string, sign JWTHeader) string {
 
 	header := "{\"alg\": \"" + sign.hash + "\",\"typ\": \"JWT\"\n}"
 	message := base64.RawURLEncoding.EncodeToString([]byte(header)) + "." +
-		base64.RawURLEncoding.EncodeToString([]byte(payload))
+		base64.RawURLEncoding.EncodeToString(payload)
 
 	mac.Write([]byte(message))
 	calculatedMAC := mac.Sum(nil)
@@ -188,25 +229,13 @@ func buildJWT(payload string, sign JWTHeader) string {
 	result := message + "." + base64.RawURLEncoding.EncodeToString(calculatedMAC)
 
 	return result
-	//decodedVerification, errDecode := base64.RawURLEncoding.DecodeString(token.verification)
-	//if errDecode != nil {
-	//	return false, errDecode
-	//}
-
-	//if hmac.Equal(decodedVerification, expectedMAC) {
-	//	return true, nil
-	//}
-	//return false, nil
-
 }
 
 // preprocessJWT Takes the request header string, strips prefix and whitespaces and returns a Token
 func preprocessJWT(reqHeader string, prefix string) (Token, error) {
-	// fmt.Println("==> [processHeader] SplitAfter")
-	// structuredHeader := strings.SplitAfter(reqHeader, "Bearer ")[1]
+
 	cleanedString := strings.TrimPrefix(reqHeader, prefix)
 	cleanedString = strings.TrimSpace(cleanedString)
-	// fmt.Println("<== [processHeader] SplitAfter", cleanedString)
 
 	var token Token
 
